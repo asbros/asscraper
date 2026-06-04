@@ -11,7 +11,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ==========================================
-# 1. 47 PROVIDERS DATABASE (Categorized)
+# 1. 47 PROVIDERS DATABASE
 # ==========================================
 PROVIDERS = {
     "Moviesmod": {"name": "Moviesmod", "url": "https://moviesmod.farm", "type": "wp_json"},
@@ -74,7 +74,7 @@ def clean_html(raw_html):
     return re.sub(cleanr, '', raw_html).replace('&#8211;', '-').replace('&#8217;', "'").replace('&#8230;', '...')
 
 # ==========================================
-# 3. CORE SCRAPING STRATEGIES (Step 1: Search)
+# 3. CORE SCRAPING STRATEGIES (No Garbage Logic)
 # ==========================================
 def strategy_wp_json(query, base_url):
     scraper = get_scraper()
@@ -89,9 +89,10 @@ def strategy_wp_json(query, base_url):
                 img = ""
                 try: img = item['_embedded']['wp:featuredmedia'][0]['source_url']
                 except: pass
-                if link: results.append({"title": title, "link": link, "image": img})
-    except Exception as e:
-        print(f"[Error wp_json] {base_url} -> {e}")
+                if link and len(title) > 2: results.append({"title": title, "link": link, "image": img})
+    except Exception:
+        # Error log ko chota kar diya gaya hai
+        print(f"[-] Skipped {base_url} (Site Down/Blocked)")
     return results
 
 def strategy_pingora(query, base_url):
@@ -104,9 +105,12 @@ def strategy_pingora(query, base_url):
         if res.status_code == 200:
             for hit in res.json().get('hits', []):
                 doc = hit.get('document', {})
-                results.append({"title": doc.get('post_title', 'Unknown'), "link": doc.get('permalink', ''), "image": doc.get('post_thumbnail', '')})
-    except Exception as e:
-        print(f"[Error pingora] {base_url} -> {e}")
+                title = doc.get('post_title', 'Unknown')
+                link = doc.get('permalink', '')
+                if link and len(title) > 2:
+                    results.append({"title": title, "link": link, "image": doc.get('post_thumbnail', '')})
+    except Exception:
+        print(f"[-] Skipped {base_url} (Site Down/Blocked)")
     return results
 
 def strategy_html(query, base_url):
@@ -118,10 +122,17 @@ def strategy_html(query, base_url):
         soup = BeautifulSoup(res.text, 'html.parser')
         
         cards = soup.find_all(['article', 'div', 'li'], class_=['item', 'post-item', 'result-item', 'movie-card', 'post'])
+        
         if not cards:
+            # Agar proper cards nahi mile, toh sirf wahi links uthayenge jo images rakhte hain
+            # aur sath me proper filtering apply karenge
             cards = [a for a in soup.find_all('a') if a.find('img')]
             
         unique_links = set()
+        
+        # In words ko contain karne wale links kachra (garbage) hote hain
+        bad_keywords = ['/category/', '/genre/', '/tag/', '/author/', '/page/', 'login', 'register', 'contact']
+        
         for card in cards:
             a_tag = card if card.name == 'a' else card.find('a')
             if not a_tag: continue
@@ -129,17 +140,22 @@ def strategy_html(query, base_url):
             link = a_tag.get('href', '')
             if not link or '#' in link or not link.startswith('http'): continue
             
+            # Agar link me garbage keyword hai, toh yahi block kar do
+            if any(bad in link.lower() for bad in bad_keywords): 
+                continue
+            
             title_tag = card.find(['h2', 'h3', 'div'], class_=['title', 'entry-title'])
             title = title_tag.text.strip() if title_tag else (a_tag.get('title') or a_tag.text.strip())
             
             img_tag = card.find('img') if card.name != 'a' else card.find('img')
             img = img_tag.get('src') or img_tag.get('data-src') if img_tag else ""
             
-            if len(title) > 2 and link not in unique_links:
+            # Title kam se kam 4 character ka hona chahiye (taaki icon wagaira block ho jaye)
+            if title and len(title) > 3 and link not in unique_links:
                 unique_links.add(link)
                 results.append({"title": title, "link": link, "image": img})
-    except Exception as e:
-        print(f"[Error html] {base_url} -> {e}")
+    except Exception:
+        print(f"[-] Skipped {base_url} (Site Down/Blocked)")
     return results
 
 def strategy_autoembed(query):
@@ -155,7 +171,7 @@ def home():
 @app.route("/search")
 def search_movie():
     query = request.args.get('q', '')
-    provider_keys_param = request.args.get('provider', 'hdhub') # e.g., 'hdhub,vega' or 'all'
+    provider_keys_param = request.args.get('provider', 'hdhub')
     
     if not query: return jsonify({"error": "Provide a query."})
     
@@ -163,17 +179,15 @@ def search_movie():
     if provider_keys_param.lower() == 'all':
         provider_keys = list(PROVIDERS.keys())
     else:
-        # Split by comma for multiple providers
         provider_keys = [k.strip() for k in provider_keys_param.split(',')]
         
     all_results = []
     
-    # Use ThreadPool to search multiple providers at once for speed
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_provider = {}
         for key in provider_keys:
             if key not in PROVIDERS:
-                continue # Skip invalid keys
+                continue
             prov = PROVIDERS[key]
             
             if prov['type'] == 'wp_json':
@@ -193,8 +207,8 @@ def search_movie():
                 for r in res:
                     r['provider'] = prov_name
                 all_results.extend(res)
-            except Exception as exc:
-                print(f"[-] {prov_name} generated an exception: {exc}")
+            except Exception:
+                pass # Agar Threading me error aye to chup chap aage badh jao
 
     return jsonify({
         "status": "success", 
@@ -203,7 +217,7 @@ def search_movie():
         "data": all_results
     })
 
-# --- SUPER FILTERED LINK EXTRACTOR (Fixed for Garbage Links) ---
+# --- SUPER FILTERED LINK EXTRACTOR ---
 @app.route("/get-links")
 def get_links():
     movie_path = request.args.get('url', '')
@@ -212,7 +226,6 @@ def get_links():
     scraper = get_scraper()
     print(f"\n[+] Extracting Data from: {movie_path}")
     
-    # Base domain nikalna taaki internal related movies block kar sakein
     base_domain = urllib.parse.urlparse(movie_path).netloc
     
     try:
@@ -220,26 +233,24 @@ def get_links():
         res = scraper.get(movie_path, headers=headers, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # Focus on content area to avoid sidebar junk
         content_area = soup.find('div', class_=['entry-content', 'post-content', 'thecontent', 'content-area', 'post-single-content'])
         search_area = content_area if content_area else soup
         
         streaming_links = []
         unique_urls = set()
         
-        # 1. IFRAME EXTRACTOR (Direct players)
+        # 1. IFRAME EXTRACTOR
         for iframe in search_area.find_all('iframe'):
             src = iframe.get('src') or iframe.get('data-src') or iframe.get('data-lazy-src')
             if not src: continue
             if src.startswith('//'): src = 'https:' + src
-            # Ignore YouTube trailers and FB
             if 'youtube.com' in src or 'youtu.be' in src or 'facebook.com' in src: continue
                 
             if src not in unique_urls and src.startswith('http'):
                 unique_urls.add(src)
                 streaming_links.append({"quality": "Direct Player", "link": src, "type": "player"})
 
-        # 2. BUTTON/SERVER LINK EXTRACTOR
+        # 2. SERVER LINK EXTRACTOR
         player_buttons = search_area.find_all(['li', 'div', 'button', 'a'], class_=re.compile(r'dooplay|player|server|source|btn|button', re.IGNORECASE))
         for btn in player_buttons:
             url = btn.get('data-url') or btn.get('data-embed') or btn.get('data-src')
@@ -249,7 +260,6 @@ def get_links():
                 streaming_links.append({"quality": f"Watch on {name}", "link": url, "type": "server_link"})
 
         # 3. STRICT DOWNLOAD LINKS EXTRACTOR
-        # Sirf wahi link pass honge jinke text me resolution ya size ho, garbage nahi
         valid_resolutions = ['480p', '720p', '1080p', '2160p', '4k', 'mb', 'gb']
         valid_hosts = ['drive.google', 'hubcloud', 'filepress', 'mega.nz', 'gadgetsweb', 'linkstaker']
         
@@ -260,12 +270,9 @@ def get_links():
             if not href or href == '#' or 'category/' in href or 'genre/' in href:
                 continue
                 
-            # STRICT RULE 1: Block internal movie suggestion links
-            # Agar link me wahi domain hai aur text me resolution/size nahi hai, to hatao
             if base_domain in href and not any(res in text for res in valid_resolutions):
                 continue
             
-            # STRICT RULE 2: Keep only if text looks like a download button OR href has known host
             has_resolution = any(res in text for res in valid_resolutions)
             has_valid_host = any(host in href for host in valid_hosts)
             
@@ -299,7 +306,7 @@ def get_links():
         })
     except Exception as e:
         print(f"[-] Error extracting links: {e}")
-        return jsonify({"error": "Failed to fetch links or episodes.", "details": str(e)})
+        return jsonify({"error": "Failed to fetch links.", "details": str(e)})
 
 if __name__ == "__main__":
     print("🚀 API starting on http://localhost:8000")
